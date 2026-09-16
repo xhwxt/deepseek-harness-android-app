@@ -211,6 +211,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         enginePort = defaultEnginePort(this); // 三版本各自独立端口（见 defaultEnginePort）
+        applyStatusBar(); // v1.13.8：状态栏/导航栏底色跟随 App 主题（浅色模式不再是一条黑条）
         installCrashHandler();
         checkAbiCompat(); // ② ABI 检测：非 arm64 设备引擎可能无法运行，弹提示
         checkBatteryOptimization(); // ④ 电池优化引导：被限制时提示（挂后台可能被杀）
@@ -501,6 +502,28 @@ public class MainActivity extends Activity {
             }
         }, "取消");
     }
+
+    /**
+     * v1.13.8：状态栏/导航栏底色跟随主题（跟随系统深/浅色，与 cBg() 一致），
+     * 浅色模式配深色图标（SYSTEM_UI_FLAG_LIGHT_STATUS_BAR），深色模式配浅色图标。
+     * 旧实现只在 styles.xml 里写死 #0b0f1a → 浅色主题下状态栏是一条黑条。
+     */
+    private void applyStatusBar() {
+        try {
+            boolean dark = isDark();
+            int bar = Color.parseColor(dark ? "#0b0f1a" : "#f7f8fb");
+            getWindow().setStatusBarColor(bar);
+            getWindow().setNavigationBarColor(bar);
+            android.view.View decor = getWindow().getDecorView();
+            int flags = decor.getSystemUiVisibility();
+            if (dark) flags &= ~android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            else flags |= android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            decor.setSystemUiVisibility(flags);
+        } catch (Throwable ignored) {}
+    }
+
+    /** v1.13.8：虚拟屏桥接端口。共存修复版（.fix）用 9009，避免和正式版 8999 抢（见 VsreenBridgeService）。 */
+    private int vscreenBridgePort() { return getPackageName().contains(".fix") ? 9009 : 8999; }
 
     // ============ 界面主题色（跟随系统深/浅色，权限页与加载页共用）============
     private boolean isDark() {
@@ -3129,6 +3152,8 @@ public class MainActivity extends Activity {
         env.put("SHIZUKU_DEX", rishDex != null ? rishDex.getAbsolutePath() : "");
         // v1.9 虚拟屏 server dex：app_process 特权加载 VirtualScreenServer
         env.put("VS_DEX", vscreenDex != null ? vscreenDex.getAbsolutePath() : "");
+        // v1.13.8：告诉引擎侧的 dsh-tool-vscreen 插件该连哪个桥端口（插件里 fallback 8999）
+        env.put("APP_VS_PORT", String.valueOf(vscreenBridgePort()));
         // v1.13 修正：这里原来**硬编码** "com.deepseek.harness.beta"，而三版共用同一份源码 —— 正式版跑起来
         // 也在自称 beta，而 rish 要拿这个 appId 去 Shizuku 要授权，Shizuku 比对实际调用者的包名/uid
         // （正式版 uid ≠ beta uid）→ 门卫不认（用户回报：“SHIZUKU_APP_ID=…beta，但真正在跑的是 com.deepseek.harness”）。
