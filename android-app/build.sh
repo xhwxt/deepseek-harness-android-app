@@ -24,6 +24,21 @@ esac
 # 签名密钥（自行准备，不入仓库）
 KEY="$P/release.jks"
 
+# ===================== 变体（v1.13.7 新增）=====================
+# 用法：bash android-app/build.sh [release|coexist]
+#   release（默认）= 正式版  com.deepseek.harness        （端口 3080，/sdcard/DeepSeekHarness）
+#   coexist        = 共存修复版 com.deepseek.harness.fix （端口 3086，/sdcard/DeepSeekHarnessFix）
+#                    —— 包名不同 → 可与正式版**同时安装**，互不覆盖（数据/端口/悬浮窗都独立；
+#                       API Key 需要在新版里重新填一次）。
+# 实现要点：源码目录结构完全不动，只把 manifest 的 package 与两个 provider authority 换成
+#   .fix，并用 aapt --custom-package 让 R.java 仍然生成在 com.deepseek.harness
+#   （否则源码里的 R 找不到，javac 会直接失败）。
+VARIANT="${1:-${VARIANT:-release}}"
+MANIFEST="$P/AndroidManifest.xml"
+RES="$P/res"
+CUSTOM_PKG=""
+APK_NAME="DeepSeekHarness.apk"
+
 echo "== 0/7 组装 payload =="
 # 移动端适配注入（mobile.css，不覆盖原生 index.html，DSH 更新后也自动重新注入）
 sh "$P/../mobile-patch/inject.sh"
@@ -33,6 +48,50 @@ mkdir -p "$P/staging/runtime/bin" "$P/staging/runtime/lib" \
          "$P/staging/runtime/etc" \
          "$P/staging/bin" "$P/staging/dshroot" \
          "$P/staging/dshhome/profiles/web" "$P/assets"
+
+case "$VARIANT" in
+  coexist|fix)
+    VD="$P/out/variant"
+    mkdir -p "$VD"
+    cp -r "$P/res" "$VD/res"
+    sed -e 's/package="com\.deepseek\.harness"/package="com.deepseek.harness.fix"/' \
+        -e 's/android:authorities="com\.deepseek\.harness\.shizuku"/android:authorities="com.deepseek.harness.fix.shizuku"/' \
+        -e 's/android:authorities="com\.deepseek\.harness\.logshare"/android:authorities="com.deepseek.harness.fix.logshare"/' \
+        -e 's/android:label="DeepSeek Harness 屏幕助手"/android:label="DSH 修复版 屏幕助手"/' \
+        -e 's/android:name="\./android:name="com.deepseek.harness./g' \
+        "$P/AndroidManifest.xml" > "$VD/AndroidManifest.xml"
+    sed -i 's/>DeepSeek Harness</>DSH 修复版</' "$VD/res/values/strings.xml"
+    # 变体必须真的改到包名/authority/组件名，否则装到机器上会和正式版打架（provider 冲突 → 安装失败），
+    # 或者 .MainActivity 这类相对名字会按新包名解析成 com.deepseek.harness.fix.MainActivity → 启动即崩。
+    grep -q 'package="com.deepseek.harness.fix"' "$VD/AndroidManifest.xml" \
+      || { echo "!! 变体 manifest 生成失败（package 没换成 .fix）"; exit 1; }
+    grep -q 'com.deepseek.harness.fix.shizuku' "$VD/AndroidManifest.xml" \
+      || { echo "!! 变体 manifest 生成失败（ShizukuProvider authority 没换）"; exit 1; }
+    grep -q 'android:name="com.deepseek.harness.MainActivity"' "$VD/AndroidManifest.xml" \
+      || { echo "!! 变体 manifest 生成失败（组件名没改成绝对包名，会出现 ClassNotFound）"; exit 1; }
+    # 用 if 而不是 grep && {...}：后者在「没有相对名」这条正常路径上会让 set -e 误伤
+    if grep -q 'android:name="\.' "$VD/AndroidManifest.xml"; then
+      echo "!! 变体 manifest 里还有相对组件名没展开"; exit 1
+    fi
+    # 变体自检：源码里不允许再有「按包名拼类名」的反射 —— 变体只换 manifest 包名，
+    # Java 类仍在 com.deepseek.harness 下，拼出来的类名一定 ClassNotFoundException。
+    # v1.13.7 实测：VsreenBridgeService 因此没起来 → 预览窗永远不出现（排查绕了一大圈）。
+    # 只看“拼类名”（后缀大写开头，如 .VsreenBridgeService）；".logshare" 这类 authority 是包名派生，合法；
+    # 同时忽略注释行（注释里可能出现同样的字面量）。
+    if grep -rnE 'getPackageName\(\) *\+ *"\.[A-Z]' "$P/src" 2>/dev/null | grep -vE ':[0-9]+:[[:space:]]*//' | grep -q .; then
+      echo "!! 变体自检失败：源码里仍有按包名拼类名的写法（变体下必 ClassNotFoundException）："
+      grep -rnE 'getPackageName\(\) *\+ *"\.[A-Z]' "$P/src" | grep -vE ':[0-9]+:[[:space:]]*//'
+      exit 1
+    fi
+    MANIFEST="$VD/AndroidManifest.xml"
+    RES="$VD/res"
+    CUSTOM_PKG="--custom-package com.deepseek.harness"
+    APK_NAME="DeepSeekHarness-fix.apk"
+    echo "== 变体：共存修复版 com.deepseek.harness.fix（端口 3086，数据目录 DeepSeekHarnessFix）=="
+    ;;
+  release|"") ;;
+  *) echo "!! 未知变体：$VARIANT（可选：release / coexist）"; exit 1 ;;
+esac
 
 # Termux 共存修复（v1.7.4）：内置 node 在 Termux 环境编译，OPENSSLDIR 编译死为
 # /data/data/com.termux/files/usr。装了 Termux 的设备读其 openssl.cnf 触发 EACCES，
@@ -202,7 +261,7 @@ echo "payload.zip: $(du -sh "$P/assets/payload.zip" | cut -f1)"
 
 echo "== 1/7 资源编译 (aapt) =="
 mkdir -p "$P/out/gen" "$P/out/classes" "$P/out/dex"
-aapt package -f -m -J "$P/out/gen" -M "$P/AndroidManifest.xml" -S "$P/res" -I "$AJ"
+aapt package -f -m -J "$P/out/gen" -M "$MANIFEST" -S "$RES" -I "$AJ" $CUSTOM_PKG
 
 echo "== 2/7 javac =="
 # 解压 Shizuku API + provider + aidl 的 classes.jar 供编译和 dex
@@ -256,7 +315,7 @@ fi
 echo "  classes.dex 含 MainActivity，$(stat -c%s "$P/out/dex/classes.dex") bytes"
 
 echo "== 4/7 aapt 打包 + assets =="
-aapt package -f -M "$P/AndroidManifest.xml" -S "$P/res" -I "$AJ" -A "$P/assets" -0 zip -F "$P/out/unsigned.apk"
+aapt package -f -M "$MANIFEST" -S "$RES" -I "$AJ" $CUSTOM_PKG -A "$P/assets" -0 zip -F "$P/out/unsigned.apk"
 ( cd "$P/out/dex" && aapt add "$P/out/unsigned.apk" classes.dex )
 
 echo "== 5/7 zipalign =="
@@ -265,10 +324,10 @@ zipalign -f 4 "$P/out/unsigned.apk" "$P/out/aligned.apk"
 echo "== 6/7 签名 =="
 [ -f "$KEY" ] || { echo "!! 缺少签名密钥 $KEY（release.jks 不入仓库，请自行准备）"; exit 1; }
 "$APKSIGNER" sign --ks "$KEY" --ks-pass "pass:${KEYSTORE_PASS:?请先 export KEYSTORE_PASS=签名密码}" --ks-key-alias "${KEYSTORE_ALIAS:-dsh}" --key-pass "pass:$KEYSTORE_PASS" \
-  --out "$P/DeepSeekHarness.apk" "$P/out/aligned.apk"
+  --out "$P/$APK_NAME" "$P/out/aligned.apk"
 
 echo "== 7/7 校验 =="
-"$APKSIGNER" verify --print-certs "$P/DeepSeekHarness.apk"
-aapt dump badging "$P/DeepSeekHarness.apk" | head -8
-ls -la "$P/DeepSeekHarness.apk"
-echo "BUILD OK -> $P/DeepSeekHarness.apk"
+"$APKSIGNER" verify --print-certs "$P/$APK_NAME"
+aapt dump badging "$P/$APK_NAME" | head -8
+ls -la "$P/$APK_NAME"
+echo "BUILD OK -> $P/$APK_NAME"

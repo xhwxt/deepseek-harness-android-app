@@ -2,8 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     package="com.deepseek.harness"
-    android:versionCode="33"
-    android:versionName="1.13.6">
+    android:versionCode="37"
+    android:versionName="1.13.10">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="28" />
 
@@ -39,9 +39,18 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:screenOrientation="unspecified"
+            android:screenOrientation="fullUser"
             android:configChanges="orientation|screenSize|keyboardHidden"
-            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+            android:theme="@style/AppTheme">
+            <!-- v1.13.7 问题⑥：原来写的是 unspecified —— 语义是「我不表态，系统看着办」，
+                 真机上表现为**沿用当前屏幕旋转**：从横屏的游戏/视频切过来，App 就一直是横屏，
+                 哪怕手机已经竖回来了（跟随的是「上一个应用」，不是系统设置）。
+                 改成 fullUser：== 系统设置里「自动旋转」开着 → 跟随重力感应（含反向横竖屏）；
+                 关着（锁定方向）→ 跟随用户锁定，不会被上一个 App 带跑。 -->
+            <!-- v1.13.7 问题④：原主题 @android:style/Theme.Black.NoTitleBar.Fullscreen
+                 会隐藏状态栏，ColorOS 上窗口还被下移 133px → 顶部一块黑条。
+                 改为 res/values/styles.xml 里的 AppTheme（父主题 Theme.Black.NoTitleBar，
+                 不隐藏状态栏，状态栏底色 = App 深色底）。 -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

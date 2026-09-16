@@ -104,7 +104,7 @@ public class AccessibilityService extends android.accessibilityservice.Accessibi
         int port = 3181;
         try {
             String pkg = getPackageName();
-            int defaultEngine = pkg.contains("beta") ? 3082 : pkg.contains("compat") ? 3084 : 3080;
+            int defaultEngine = pkg.contains("beta") ? 3082 : pkg.contains("compat") ? 3084 : pkg.contains(".fix") ? 3086 : 3080;
             port = defaultEngine + 101;
             SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
             if (prefs.getInt(KEY_A11Y_PORT, port) != port) {
@@ -1237,7 +1237,7 @@ public class AccessibilityService extends android.accessibilityservice.Accessibi
             if (ext != null) {
                 String p = getPackageName();
                 String root = p.contains("beta") ? "DeepSeekHarnessLite"
-                        : p.contains("compat") ? "DeepSeekHarnessCompat"
+                        : p.contains("compat") ? "DeepSeekHarnessCompat" : p.contains(".fix") ? "DeepSeekHarnessFix"
                         : "DeepSeekHarness";
                 File d = new File(new File(ext, root), "screenshots");
                 if (d.exists() || d.mkdirs()) return d;

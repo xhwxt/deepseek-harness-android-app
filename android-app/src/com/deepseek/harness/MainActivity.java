@@ -156,6 +156,7 @@ public class MainActivity extends Activity {
     private View conBar, conFill, conSpacer;
     private Button conExBtn, conEnBtn, conEnRestart, conEnStop;
     private View conDetailBox;
+    private View dialogOverlay = null;   // v1.13.7 问题⑤：自绘弹窗的遮罩层（替代系统 AlertDialog）
     private final Runnable consoleTick = new Runnable() {
         @Override public void run() {
             if (!consoleVisible) return;
@@ -210,6 +211,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         enginePort = defaultEnginePort(this); // 三版本各自独立端口（见 defaultEnginePort）
+        applyStatusBar(); // v1.13.8：状态栏/导航栏底色跟随 App 主题（浅色模式不再是一条黑条）
         installCrashHandler();
         checkAbiCompat(); // ② ABI 检测：非 arm64 设备引擎可能无法运行，弹提示
         checkBatteryOptimization(); // ④ 电池优化引导：被限制时提示（挂后台可能被杀）
@@ -289,10 +291,16 @@ public class MainActivity extends Activity {
         // 提取 rish dex（DSH 的 shizuku_shell 插件执行命令用，与 payload 解压解耦）
         rishDex = extractRishDex();
         vscreenDex = extractVscreenDex();
-        // 虚拟屏接入桥：启动 Operit server + HTTP->binder 转发（插件走 8999）
+        // 虚拟屏接入桥：启动 Operit server + HTTP->binder 转发（正式版插件走 8999 / 共存版 9009）
+        // v1.13.10 修：原来是用反射按包名拼出 VsreenBridgeService 的类名（getPackageName() 加后缀）——
+        //   共存版（com.deepseek.harness.fix）会去找 com.deepseek.harness.fix.VsreenBridgeService，
+        //   而 Java 类始终在 com.deepseek.harness 下（变体只改 manifest 包名 + aapt --custom-package）
+        //   → ClassNotFoundException → **桥根本没起来** → 预览窗永远不出现。
+        //   真机 logcat 实证：09-16 15:25 W DeepSeekHarness: start VsreenBridgeService failed /
+        //   java.lang.ClassNotFoundException: com.deepseek.harness.fix.VsreenBridgeService
+        // 用类字面量即变体安全（manifest 里组件名已由 build.sh 展开成绝对包名）。
         try {
-            Class<?> bCls = Class.forName(getPackageName() + ".VsreenBridgeService");
-            startService(new Intent(this, bCls));
+            startService(new Intent(this, VsreenBridgeService.class));
         } catch (Throwable t) {
             Log.w(TAG, "start VsreenBridgeService failed", t);
         }
@@ -500,6 +508,28 @@ public class MainActivity extends Activity {
             }
         }, "取消");
     }
+
+    /**
+     * v1.13.8：状态栏/导航栏底色跟随主题（跟随系统深/浅色，与 cBg() 一致），
+     * 浅色模式配深色图标（SYSTEM_UI_FLAG_LIGHT_STATUS_BAR），深色模式配浅色图标。
+     * 旧实现只在 styles.xml 里写死 #0b0f1a → 浅色主题下状态栏是一条黑条。
+     */
+    private void applyStatusBar() {
+        try {
+            boolean dark = isDark();
+            int bar = Color.parseColor(dark ? "#0b0f1a" : "#f7f8fb");
+            getWindow().setStatusBarColor(bar);
+            getWindow().setNavigationBarColor(bar);
+            android.view.View decor = getWindow().getDecorView();
+            int flags = decor.getSystemUiVisibility();
+            if (dark) flags &= ~android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            else flags |= android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            decor.setSystemUiVisibility(flags);
+        } catch (Throwable ignored) {}
+    }
+
+    /** v1.13.8：虚拟屏桥接端口。共存修复版（.fix）用 9009，避免和正式版 8999 抢（见 VsreenBridgeService）。 */
+    private int vscreenBridgePort() { return getPackageName().contains(".fix") ? 9009 : 8999; }
 
     // ============ 界面主题色（跟随系统深/浅色，权限页与加载页共用）============
     private boolean isDark() {
@@ -1407,7 +1437,8 @@ public class MainActivity extends Activity {
     private boolean vscreenAlive() {
         try {
             java.net.Socket s = new java.net.Socket();
-            s.connect(new java.net.InetSocketAddress("127.0.0.1", 8999), 500);
+            // v1.13.10：这里原来写死 8999 —— 共存版会探到**正式版**的桥并误判「server 已在监听」。
+            s.connect(new java.net.InetSocketAddress("127.0.0.1", vscreenBridgePort()), 500);
             s.close();
             return true;
         } catch (Throwable t) { return false; }
@@ -1485,7 +1516,7 @@ public class MainActivity extends Activity {
     private String pkgRoot() {
         String p = getPackageName();
         return p.contains("beta") ? "DeepSeekHarnessLite"
-                : p.contains("compat") ? "DeepSeekHarnessCompat" : "DeepSeekHarness";
+                : p.contains("compat") ? "DeepSeekHarnessCompat" : p.contains(".fix") ? "DeepSeekHarnessFix" : "DeepSeekHarness";
     }
 
     /**
@@ -1785,7 +1816,7 @@ public class MainActivity extends Activity {
     private void writeStartupDiag(String errorMsg) {
         try {
             String sub = getPackageName().contains("beta") ? "DeepSeekHarnessLite"
-                    : getPackageName().contains("compat") ? "DeepSeekHarnessCompat" : "DeepSeekHarness";
+                    : getPackageName().contains("compat") ? "DeepSeekHarnessCompat" : getPackageName().contains(".fix") ? "DeepSeekHarnessFix" : "DeepSeekHarness";
             File dir = new File(android.os.Environment.getExternalStorageDirectory(), sub);
             if (!dir.exists()) dir.mkdirs();
             StringBuilder sb = new StringBuilder();
@@ -1933,6 +1964,7 @@ public class MainActivity extends Activity {
         String p = ctx != null ? ctx.getPackageName() : "";
         if (p.contains("beta")) return 3082;
         if (p.contains("compat")) return 3084;
+        if (p.contains(".fix")) return 3086;
         return 3080;
     }
 
@@ -3127,6 +3159,8 @@ public class MainActivity extends Activity {
         env.put("SHIZUKU_DEX", rishDex != null ? rishDex.getAbsolutePath() : "");
         // v1.9 虚拟屏 server dex：app_process 特权加载 VirtualScreenServer
         env.put("VS_DEX", vscreenDex != null ? vscreenDex.getAbsolutePath() : "");
+        // v1.13.8：告诉引擎侧的 dsh-tool-vscreen 插件该连哪个桥端口（插件里 fallback 8999）
+        env.put("APP_VS_PORT", String.valueOf(vscreenBridgePort()));
         // v1.13 修正：这里原来**硬编码** "com.deepseek.harness.beta"，而三版共用同一份源码 —— 正式版跑起来
         // 也在自称 beta，而 rish 要拿这个 appId 去 Shizuku 要授权，Shizuku 比对实际调用者的包名/uid
         // （正式版 uid ≠ beta uid）→ 门卫不认（用户回报：“SHIZUKU_APP_ID=…beta，但真正在跑的是 com.deepseek.harness”）。
@@ -3162,7 +3196,7 @@ public class MainActivity extends Activity {
         // 覆盖「node 反复崩溃但 waitForServer 未抛异常」时不产生 startup-diag.txt 的场景。
         final File extLogFile = new File(android.os.Environment.getExternalStorageDirectory(),
                 (getPackageName().contains("beta") ? "DeepSeekHarnessLite"
-                        : getPackageName().contains("compat") ? "DeepSeekHarnessCompat" : "DeepSeekHarness")
+                        : getPackageName().contains("compat") ? "DeepSeekHarnessCompat" : getPackageName().contains(".fix") ? "DeepSeekHarnessFix" : "DeepSeekHarness")
                         + "/dsh-web.log");
         new Thread(new Runnable() {
             @Override public void run() {
@@ -3952,14 +3986,13 @@ public class MainActivity extends Activity {
         if (title != null && title.length() > 0) box.addView(cText(title, 16f, cText(), true));
         if (content != null) box.addView(content, cTop(dp(12)));
 
-        final AlertDialog dlg = new AlertDialog.Builder(this).create();
         LinearLayout acts = new LinearLayout(this);
         acts.setOrientation(LinearLayout.HORIZONTAL);
         acts.setGravity(Gravity.RIGHT);
         if (negative != null) {
             Button nb = cButton(negative, false);
             nb.setOnClickListener(new View.OnClickListener() {
-                @Override public void onClick(View v) { dlg.dismiss(); }
+                @Override public void onClick(View v) { closeDialogOverlay(); }
             });
             acts.addView(nb);
         }
@@ -3967,7 +4000,7 @@ public class MainActivity extends Activity {
             Button pb = cButton(positive, true);
             pb.setOnClickListener(new View.OnClickListener() {
                 @Override public void onClick(View v) {
-                    dlg.dismiss();
+                    closeDialogOverlay();
                     if (onPositive != null) onPositive.run();
                 }
             });
@@ -3978,28 +4011,67 @@ public class MainActivity extends Activity {
         }
         box.addView(acts, cTop(dp(18)));
 
-        dlg.setView(box);
-        dlg.show();
-        try {
-            if (dlg.getWindow() != null) {
-                // 关键：窗口背景**全透明**，让卡片自己的圆角成为唯一轮廓；
-                // 再清掉系统对话框默认的内边距/最小宽度，否则那层“外框”又回来了。
-                dlg.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
-                android.view.View decor = dlg.getWindow().getDecorView();
-                if (decor instanceof android.view.ViewGroup) {
-                    ((android.view.ViewGroup) decor).setPadding(0, 0, 0, 0);
-                }
-                dlg.getWindow().setLayout(
-                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        // v1.13.7 问题⑤：改用 Activity 内自绘浮层（见 showDialogOverlay 注释），
+        // 不再走系统 AlertDialog —— 它会把主题的深色圆角面板画在卡片外面。
+        showDialogOverlay(box);
+    }
+
+    /**
+     * v1.13.7 问题⑤：把弹窗做成 Activity 自己视图树里的浮层，而不是系统对话框窗口。
+     *
+     * 症状：弹窗卡片外面还套着一层深色圆角框（用户截图可见）。
+     * 成因：AlertDialog 的面板背景来自 Activity 主题（Theme.Black 的 alertDialogTheme），
+     *   那层 frame 画在 **对话框布局自己身上**，只把 *窗口* 背景设成透明并不管用
+     *   （旧代码就是把窗口背景设透明，所以外框一直在）。
+     * 做法：自绘「遮罩 + 圆角卡片」，不经过任何系统对话框窗口 —— 没有主题面板，
+     *   也就没有外框；顺带把圆角/边距/点空白取消都握在自己手里。
+     */
+    private void showDialogOverlay(View card) {
+        closeDialogOverlay();
+        FrameLayout host = null;
+        try { host = (FrameLayout) findViewById(android.R.id.content); } catch (Throwable ignored) {}
+        if (host == null || card == null) return;
+        card.setClickable(true);                 // 卡片自己吃掉点击，避免点卡片也被当成“点空白”
+        final FrameLayout scrim = new FrameLayout(this);
+        scrim.setBackgroundColor(0xB3000000);    // 70% 黑遮罩（原系统对话框的 dim 观感）
+        scrim.setClickable(true);
+        scrim.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { closeDialogOverlay(); }   // 点空白 = 取消
+        });
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+        lp.gravity = Gravity.CENTER;
+        lp.leftMargin = dp(20);
+        lp.rightMargin = dp(20);
+        scrim.addView(card, lp);
+        // 内容再高也不超过屏幕 80%（历史日志弹窗等），超出部分由内容自己的 ScrollView 滚
+        scrim.post(new Runnable() {
+            @Override public void run() {
+                try {
+                    View c = scrim.getChildAt(0);
+                    if (c == null) return;
+                    int maxH = Math.round(getResources().getDisplayMetrics().heightPixels * 0.8f);
+                    if (c.getHeight() > maxH) {
+                        ViewGroup.LayoutParams p = c.getLayoutParams();
+                        p.height = maxH;
+                        c.setLayoutParams(p);
+                    }
+                } catch (Throwable ignored) {}
             }
-        } catch (Throwable ignored) {}
-        // 外层留出与屏幕边缘的呼吸距离（真正的对话框边距，不是面板边框）
+        });
+        host.addView(scrim, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        dialogOverlay = scrim;
+    }
+
+    /** 关掉当前自绘弹窗（没有则什么都不做）；按钮回调与返回键共用。 */
+    private void closeDialogOverlay() {
+        View v = dialogOverlay;
+        dialogOverlay = null;
+        if (v == null) return;
         try {
-            android.view.ViewGroup.LayoutParams lp = box.getLayoutParams();
-            if (lp instanceof LinearLayout.LayoutParams) {
-                ((LinearLayout.LayoutParams) lp).setMargins(dp(20), 0, dp(20), 0);
-                box.setLayoutParams(lp);
-            }
+            ViewGroup p = (ViewGroup) v.getParent();
+            if (p != null) p.removeView(v);
         } catch (Throwable ignored) {}
     }
 
@@ -4144,14 +4216,24 @@ public class MainActivity extends Activity {
         startEngine();   // 文件已就绪 → 只起引擎
     }
 
+    /**
+     * v1.13.7 问题②：「重启」原来只 destroy 内存里的 nodeProcess 句柄 ——
+     * Activity 被重建 / 进程被杀后重开时那个句柄是 null，于是点了重启等于什么都没发生
+     * （用户反馈原话：“点重启其实没有用，你并没有被重启”）。
+     * 现在改成按 PID 真杀（见 killEngineNow），并等端口真正释放后再拉起新引擎。
+     */
     private void conRestartEngine() {
         if (starting) return;
         conToast("正在重启引擎…");
+        engineStoppedByUser = false;
+        engineStartAborted = false;
         new Thread(new Runnable() { @Override public void run() {
-            try {
-                if (nodeProcess != null && nodeProcess.isAlive()) nodeProcess.destroy();
-                Thread.sleep(1500);
-            } catch (Throwable ignored) {}
+            killEngineNow();
+            // 等端口释放：否则紧接着的探针会看到旧进程还 listen → 误判“已在运行” → 又不重启
+            long deadline = System.currentTimeMillis() + 10000;
+            while (System.currentTimeMillis() < deadline && portListening(enginePort)) {
+                try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+            }
             ui.post(new Runnable() { @Override public void run() { conEngineClick(); } });
         }}, "engine-restart").start();
     }
@@ -4159,15 +4241,91 @@ public class MainActivity extends Activity {
     private void conStopEngine() {
         // v1.13：旧实现只 destroy 进程，两个后果 —— ① 在飞的 waitForServer 仍每秒刷“已等待 N 秒”（界面一直计时）；
         // ② 看门狗 5 秒后看到 nodeProcess 非空却已死 → 又把引擎拉起来（用户看到的“停不掉”）。
+        // v1.13.7 问题②：同样不能只 destroy 句柄 —— 句柄丢了就什么都停不掉，改用 killEngineNow（按 PID）。
         engineStoppedByUser = true;
         engineStartAborted = true;
+        conToast("正在停止引擎…");
+        new Thread(new Runnable() { @Override public void run() {
+            killEngineNow();
+            starting = false;
+            engineStartTs = 0L;
+            ui.post(new Runnable() { @Override public void run() {
+                setStatus("引擎已停止");
+                refreshConsole();
+                conToast("引擎已停止");
+            }});
+        }}, "engine-stop").start();
+    }
+
+    /**
+     * v1.13.7 问题②：找出当前真正在跑的引擎 node 进程 PID（不依赖内存里的 Process 句柄）。
+     *
+     * 为什么可行：node 是本 App 的子进程、**同一个 uid**，而同 uid 的进程在 /proc 里互相可见
+     * （真机实测：App 身份能读到 /proc/&lt;pid&gt;/cmdline）。所以哪怕 Activity 被重建、
+     * 句柄丢了，也仍然能定位并终止它。
+     * 认人条件：cmdline 同时含 bin.js、web、--port &lt;enginePort&gt;，避免误杀别的 node。
+     */
+    private int findEnginePid() {
+        File[] kids;
+        try { kids = new File("/proc").listFiles(); } catch (Throwable t) { return -1; }
+        if (kids == null) return -1;
+        int self = android.os.Process.myPid();
+        for (File d : kids) {
+            String name = d.getName();
+            if (name == null || name.isEmpty() || !Character.isDigit(name.charAt(0))) continue;
+            int pid;
+            try { pid = Integer.parseInt(name); } catch (Throwable t) { continue; }
+            if (pid == self) continue;
+            String cmd = readProcCmdline(pid);
+            if (cmd == null || cmd.length() == 0) continue;
+            if (cmd.indexOf("bin.js") < 0) continue;
+            if (cmd.indexOf(" web") < 0) continue;
+            if (cmd.indexOf("--port " + enginePort) < 0) continue;
+            return pid;
+        }
+        return -1;
+    }
+
+    /** 读 /proc/&lt;pid&gt;/cmdline（NUL 分隔 → 空格）。读不到返回 null。 */
+    private String readProcCmdline(int pid) {
+        FileInputStream in = null;
+        try {
+            in = new FileInputStream("/proc/" + pid + "/cmdline");
+            byte[] buf = new byte[1024];
+            int n = in.read(buf);
+            if (n <= 0) return "";
+            for (int i = 0; i < n; i++) if (buf[i] == 0) buf[i] = ' ';
+            return new String(buf, 0, n, "UTF-8");
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            try { if (in != null) in.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    /**
+     * v1.13.7 问题②：真把引擎进程杀掉（阻塞直到死透或超时）。
+     * 先 SIGTERM 让 node 正常退出（会释放端口），6 秒内没死再 SIGKILL 兜底。
+     * 调用方必须在后台线程（内部有 sleep / 轮询）。
+     */
+    private void killEngineNow() {
+        int pid = findEnginePid();
+        if (pid > 0) {
+            try { android.os.Process.sendSignal(pid, 15); } catch (Throwable ignored) {}   // SIGTERM
+        }
         try { if (nodeProcess != null && nodeProcess.isAlive()) nodeProcess.destroy(); } catch (Throwable ignored) {}
+        long deadline = System.currentTimeMillis() + 6000;
+        while (System.currentTimeMillis() < deadline) {
+            if (findEnginePid() <= 0) break;
+            try { Thread.sleep(200); } catch (InterruptedException e) { break; }
+        }
+        int still = findEnginePid();
+        if (still > 0) {
+            Log.w(TAG, "engine pid " + still + " still alive after SIGTERM, SIGKILL");
+            try { android.os.Process.killProcess(still); } catch (Throwable ignored) {}     // SIGKILL 兜底
+            try { Thread.sleep(600); } catch (InterruptedException ignored) {}
+        }
         nodeProcess = null;
-        starting = false;
-        engineStartTs = 0L;
-        setStatus("引擎已停止");
-        refreshConsole();
-        conToast("引擎已停止");
     }
 
     private void enterMainUi() {
@@ -4946,6 +5104,8 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        // v1.13.7 问题⑤：自绘弹窗优先吃掉返回键（等同“取消”），避免返回键穿透到下层
+        if (dialogOverlay != null) { closeDialogOverlay(); return; }
         // v1.12：控制台内的返回先回控制台首页，再退出
         if (consoleVisible) {
             if (consolePage != 0) { consolePage = 0; renderConsole(); return; }

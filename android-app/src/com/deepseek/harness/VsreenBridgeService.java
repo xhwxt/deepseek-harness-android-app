@@ -18,8 +18,10 @@ import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 import android.view.View;
 import android.view.WindowManager;
+import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import java.io.BufferedReader;
@@ -57,9 +59,12 @@ public class VsreenBridgeService extends Service {
     private static final String TAG = "VsreenBridge";
 
     /** 插件使用的对外端口（本服务的代理端口）。 */
-    private static final int PORT = 8999;
+    // v1.13.8：桥接/核心端口按包名派生 —— 共存修复版（.fix）必须避开正式版的 8999/8998，
+    // 否则正式版先占了 8999，修复版的桥 bind 静默失败 → 它的预览窗根本建不出来
+    //（用户实测「控制条没出现」，其实是看到了正式版 v1.13.6 那个没有按钮的预览窗）。
+    private int bridgePort() { return getPackageName().contains(".fix") ? 9009 : 8999; }
     /** 特权服务端端口。 */
-    private static final int CORE_PORT = 8998;
+    private int corePort() { return getPackageName().contains(".fix") ? 9008 : 8998; }
     /** 特权服务端主类。 */
     private static final String CORE_MAIN = "com.deepseek.harness.vscreen.Main";
 
@@ -94,6 +99,14 @@ public class VsreenBridgeService extends Service {
     private volatile int vdDisplayId = -1;
     /** 已应用的宽高比，用于只在变屏/旋转时重算窗口高度，不干扰用户手动拖动/缩放。 */
     private volatile float lastAspect = 0f;
+    /** v1.13.7 问题③：用户点了 ✕ 关掉的虚拟屏 displayId —— 轮询别再自动把它弹回来。 */
+    private volatile int previewDismissedDisplayId = Integer.MIN_VALUE;
+    /** v1.13.8：预览窗是否已最小化（只留一条按钮栏）。 */
+    private volatile boolean previewCollapsed = false;
+    /** v1.13.8：最小化前记住的画面高度，展开时恢复。 */
+    private volatile int previewExpandedH = 0;
+    /** v1.13.8：最小化/展开按钮（文案在 ▾ / ▴ 之间切换）。 */
+    private Button previewFoldBtn = null;
 
     private void showPreviewWindow() {
         try {
@@ -133,6 +146,28 @@ public class VsreenBridgeService extends Service {
                             FrameLayout.LayoutParams.MATCH_PARENT,
                             FrameLayout.LayoutParams.MATCH_PARENT));
 
+            // v1.13.7 问题③：原来预览窗只有「拖动 + 双指缩放」，界面上**没有任何关闭/缩小的入口**，
+            // 用户只能干看着它悬在屏幕上挡着（想关只能让 AI 调 android_vscreen_close）。
+            // 现在在右上角加三个小钮：✕ 关闭预览、− 缩小、＋ 放大（拖动 / 双指缩放照旧可用）。
+            LinearLayout ctl = new LinearLayout(this);
+            ctl.setOrientation(LinearLayout.HORIZONTAL);
+            ctl.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+            ctl.addView(previewButton("✕", new Runnable() { @Override public void run() {
+                // 记下“是用户主动关的”：轮询发现虚拟屏还在跑时不要再自动弹回来（换一块虚拟屏会重新弹）
+                previewDismissedDisplayId = vdDisplayId;
+                hidePreviewWindow();
+            }}));
+            // v1.13.8：最小化/展开（只留这条按钮栏，画面收起；再点一次恢复）
+            previewFoldBtn = previewButton("▾", new Runnable() { @Override public void run() { togglePreviewCollapsed(); } });
+            ctl.addView(previewFoldBtn);
+            // 缩放不加按钮：双指捏合已经能缩放（用户要求），按钮栏只保留 关闭 / 最小化
+            FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+            clp.gravity = Gravity.TOP | Gravity.END;
+            clp.topMargin = dp(4);
+            clp.rightMargin = dp(4);
+            previewRootView.addView(ctl, clp);
+
             // 建窗即按当前虚拟屏比例算尺寸（否则要等下一次比例“变化”才生效）
             lastAspect = 0f;
             if (vdW > 0 && vdH > 0) {
@@ -145,17 +180,15 @@ public class VsreenBridgeService extends Service {
 
             scaleDetector = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
                 @Override public boolean onScale(ScaleGestureDetector detector) {
-                    if (previewLp != null) {
-                        float f = detector.getScaleFactor();
-                        int nw = Math.round(previewLp.width * f);
-                        int nh = Math.round(previewLp.height * f);
-                        if (nw >= dp(120) && nw <= getResources().getDisplayMetrics().widthPixels
-                                && nh >= dp(200) && nh <= getResources().getDisplayMetrics().heightPixels) {
-                            previewLp.width = nw;
-                            previewLp.height = nh;
-                            updatePreviewLayout();
-                        }
-                    }
+                    // v1.13.8：最小化时不响应双指缩放；缩放后统一走 clampPreviewBounds()
+                    //（旧实现只在一处夹边界，双指放大就能把窗口撑到屏幕外，
+                    //  于是右上角的按钮条被推出屏幕 → 用户看到的就是“控制条没有出现”）
+                    if (previewLp == null || previewCollapsed) return true;
+                    float f = detector.getScaleFactor();
+                    previewLp.width = Math.max(dp(120), Math.round(previewLp.width * f));
+                    previewLp.height = Math.max(barHeightPx(), Math.round(previewLp.height * f));
+                    clampPreviewBounds();
+                    updatePreviewLayout();
                     return true;
                 }
             });
@@ -175,6 +208,8 @@ public class VsreenBridgeService extends Service {
                                 float dy = e.getRawY() - downY;
                                 previewLp.x = Math.round(startLpX + dx);
                                 previewLp.y = Math.round(startLpY + dy);
+                                // v1.13.8：统一夹边界（含状态栏让位后的可用高度），保证按钮条永远可点
+                                clampPreviewBounds();
                                 updatePreviewLayout();
                             }
                             return true;
@@ -183,6 +218,7 @@ public class VsreenBridgeService extends Service {
                 }
             });
 
+            clampPreviewBounds();          // v1.13.8：建窗即夹，避免初始就超出屏幕
             previewWm.addView(previewRootView, previewLp);
             previewWindowVisible = true;
             Log.i(TAG, "虚拟屏预览窗已显示（可拖动/双指缩放）");
@@ -202,6 +238,102 @@ public class VsreenBridgeService extends Service {
         }
     }
 
+    /**
+     * v1.13.7 问题③：预览窗右上角的小圆钮（✕ / − / ＋）。
+     * 半透明圆角底 + 白字，直接叠在画面上；按钮自己消费点击，
+     * 所以点按钮不会触发根布局的拖动/缩放。
+     */
+    private Button previewButton(String text, final Runnable action) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setTextSize(13);
+        b.setTextColor(0xFFFFFFFF);
+        b.setPadding(dp(9), 0, dp(9), 0);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+        b.setMinHeight(0);
+        b.setMinimumHeight(0);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0x99000000);
+        bg.setCornerRadius(dp(7));
+        b.setBackground(bg);
+        b.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { try { action.run(); } catch (Throwable ignored) {} }
+        });
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, dp(30));
+        lp.leftMargin = dp(4);
+        b.setLayoutParams(lp);
+        return b;
+    }
+
+    /**
+     * v1.13.8：把预览窗的尺寸与位置**统一**夹回可见范围。
+     * 任何会改 previewLp 的路径（建窗 / 双指缩放 / 拖动 / 折叠）都必须调它，
+     * 否则窗口能超出屏幕 —— 按钮条被推出屏幕，用户看到的就是「控制条没出现」。
+     */
+    private void clampPreviewBounds() {
+        try {
+            if (previewLp == null) return;
+            final int screenW = getResources().getDisplayMetrics().widthPixels;
+            final int usableH = usableHeight();
+            // 最大只占屏幕 70%：留出位置让下面的聊天/主屏还能操作（旧实现能被撑到满屏）
+            final int maxW = Math.max(dp(120), Math.round(screenW * 0.7f));
+            final int maxH = Math.max(barHeightPx(), Math.round(usableH * 0.7f));
+            if (previewLp.width > maxW) previewLp.width = maxW;
+            if (previewLp.width < dp(120)) previewLp.width = dp(120);
+            int minH = previewCollapsed ? barHeightPx() : dp(110);
+            if (previewLp.height > maxH) previewLp.height = maxH;
+            if (previewLp.height < minH) previewLp.height = minH;
+            if (previewLp.x > screenW - previewLp.width) previewLp.x = screenW - previewLp.width;
+            if (previewLp.y > usableH - previewLp.height) previewLp.y = usableH - previewLp.height;
+            if (previewLp.x < 0) previewLp.x = 0;
+            if (previewLp.y < 0) previewLp.y = 0;
+        } catch (Throwable ignored) {}
+    }
+
+    /** 去掉状态栏占位后的可用高度：窗口坐标是从状态栏下方开始算的（真机实测偏移 133px）。 */
+    private int usableHeight() {
+        int h = getResources().getDisplayMetrics().heightPixels - statusBarInset();
+        return h > 0 ? h : getResources().getDisplayMetrics().heightPixels;
+    }
+
+    private int statusBarInset() {
+        try {
+            int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
+            if (id > 0) return getResources().getDimensionPixelSize(id);
+        } catch (Throwable ignored) {}
+        return 0;
+    }
+
+    /** 最小化时保留的高度：一条按钮栏 + 上下留白。 */
+    private int barHeightPx() { return dp(40); }
+
+    /** v1.13.8：最小化 / 展开（只收起画面，窗户本身还在，虚拟屏照常运行）。 */
+    private void togglePreviewCollapsed() {
+        previewHandler.post(new Runnable() {
+            @Override public void run() {
+                try {
+                    if (previewLp == null || previewImageView == null) return;
+                    if (!previewCollapsed) {
+                        previewExpandedH = previewLp.height;
+                        previewCollapsed = true;
+                        previewImageView.setVisibility(View.GONE);
+                        previewLp.height = barHeightPx();
+                        if (previewFoldBtn != null) previewFoldBtn.setText("▴");
+                    } else {
+                        previewCollapsed = false;
+                        previewImageView.setVisibility(View.VISIBLE);
+                        previewLp.height = previewExpandedH > 0 ? previewExpandedH : dp(430);
+                        if (previewFoldBtn != null) previewFoldBtn.setText("▾");
+                    }
+                    clampPreviewBounds();
+                    updatePreviewLayout();
+                } catch (Throwable ignored) {}
+            }
+        });
+    }
+
     private void hidePreviewWindow() {
         try {
             previewHandler.post(new Runnable() {
@@ -213,6 +345,9 @@ public class VsreenBridgeService extends Service {
                     previewImageView = null;
                     previewWm = null;
                     previewWindowVisible = false;
+                    previewCollapsed = false;    // v1.13.8：下次建窗从展开态开始
+                    previewExpandedH = 0;
+                    previewFoldBtn = null;
                     if (lastPreviewBitmap != null) {
                         lastPreviewBitmap.recycle();
                         lastPreviewBitmap = null;
@@ -241,9 +376,12 @@ public class VsreenBridgeService extends Service {
                             vdH = jsonInt(st, "height", 0);
                             if (id >= 0 && vdW > 0 && vdH > 0) applyAspect(vdW, vdH);
                             if (id >= 0 && jsonBool(st, "running")) {
-                                if (!previewWindowVisible) showPreviewWindow();
-                            } else if (previewWindowVisible) {
-                                hidePreviewWindow();
+                                // v1.13.7 问题③：用户手动 ✕ 关掉的那块虚拟屏不再自动弹回来
+                                // （虚拟屏被关掉/换新的一块时下面会清掉这个标记）
+                                if (!previewWindowVisible && id != previewDismissedDisplayId) showPreviewWindow();
+                            } else {
+                                if (id < 0) previewDismissedDisplayId = Integer.MIN_VALUE;   // 虚拟屏已销毁 → 下次重建照常弹预览
+                                if (previewWindowVisible) hidePreviewWindow();
                             }
                         }
                         sinceStatus--;
@@ -300,6 +438,7 @@ public class VsreenBridgeService extends Service {
                     int maxH = Math.round(getResources().getDisplayMetrics().heightPixels * 0.8f);
                     int minH = dp(110);
                     int h = Math.min(Math.max(Math.round(previewLp.width * aspect), minH), maxH);
+                    if (previewCollapsed) { previewExpandedH = h; return; }   // v1.13.8：最小化时只记住高度
                     if (previewLp.height != h) {
                         previewLp.height = h;
                         updatePreviewLayout();
@@ -319,7 +458,7 @@ public class VsreenBridgeService extends Service {
         // 用错目录会拿到另一个根目录下的旧 jar（8998 跑旧版服务端 → 缺新路由 → 工具报错）。
         String p = getPackageName();
         return p.contains("beta") ? "DeepSeekHarnessLite"
-                : p.contains("compat") ? "DeepSeekHarnessCompat" : "DeepSeekHarness";
+                : p.contains("compat") ? "DeepSeekHarnessCompat" : p.contains(".fix") ? "DeepSeekHarnessFix" : "DeepSeekHarness";
     }
 
     // ==================== 生命周期 ====================
@@ -335,7 +474,9 @@ public class VsreenBridgeService extends Service {
         startProxyServer();
         // 预览轮询必须常驻启动：它负责「发现虚拟屏→拉起预览窗」，不能在窗口显示后才启动（会互等死锁）
         startPreviewPolling();
-        Log.i(TAG, "VsreenBridgeService started (proxy 8999 -> core 8998)");
+        // v1.13.10：这里原来把端口写死在日志文案里（"proxy 8999 -> core 8998"）——
+        // 共存版实际跑 9009/9008，照着日志排查会得出完全错误的结论。改成打印真实端口。
+        Log.i(TAG, "VsreenBridgeService started (proxy " + bridgePort() + " -> core " + corePort() + ")");
     }
 
     @Override
@@ -385,10 +526,18 @@ public class VsreenBridgeService extends Service {
             }
             // jar 先由 shell 拷到 /data/local/tmp 再加载：/storage 对 Shizuku shell 进程不一定可见，
             // 且 /data/local/tmp 下 app_process 加载 dex 最稳（Operit/旧插件同做法）。
-            String remoteJar = "/data/local/tmp/vscreen_shizuku.jar";
-            // 启动前清掉占着 CORE_PORT 的旧 core（旧版进程不会自行退出；卸载/重装也不杀它）。
-            // 用正则（不能加 -F）+ [x] 括号技巧：既能匹配 Main，又不会匹配到这条命令自身
-            String killOld = "PID=$(ps -A -o PID,ARGS | grep 'com.deepseek.harness.vscreen.Mai[n]' "
+            // v1.13.10：jar 路径按变体分开 —— 两个 App 原来都往
+            // /data/local/tmp/vscreen_shizuku.jar 拷各自的副本（两个包里的 jar 并不相同），
+            // 后启动的那个会覆盖前一个的，对方 core 重启时加载到的就是**别人那份**代码。
+            //（/data/local/tmp/vscreen.log 仍共用：它的启动行带 `port=`，可按端口归属，暂不动。）
+            String remoteJar = "/data/local/tmp/vscreen_shizuku"
+                    + (getPackageName().contains(".fix") ? "_fix" : "") + ".jar";
+            // 启动前清掉占着 corePort() 的旧 core（旧版进程不会自行退出；卸载/重装也不杀它）。
+            // v1.13.10：必须**按端口**匹配 —— 两个变体的 core 类名完全相同
+            //（都是 com.deepseek.harness.vscreen.Main），只按类名匹配会让共存版把**正式版**的 core
+            // 一起杀掉，两边 coreWatcher 互相拉起 → 反复对杀、预览窗取不到帧。
+            // 用正则 + [x] 括号技巧：既能匹配 Main，又不会匹配到这条命令自身
+            String killOld = "PID=$(ps -A -o PID,ARGS | grep -E 'com.deepseek.harness.vscreen.Mai[n] --port " + corePort() + "( |$)' "
                     + "| grep -v grep | awk '{print $1}'); "
                     + "if [ -n \"$PID\" ]; then kill -9 $PID 2>/dev/null; sleep 1; fi; ";
             String cmd = "echo \"--- core start $(date)\" >> /data/local/tmp/vscreen.log 2>&1; "
@@ -398,7 +547,7 @@ public class VsreenBridgeService extends Service {
                     + "chmod 644 " + remoteJar + " 2>/dev/null; "
                     + "CLASSPATH=" + remoteJar
                     + " /system/bin/app_process /system/bin " + CORE_MAIN
-                    + " --port " + CORE_PORT + " --dir \"" + rootDir + "\""
+                    + " --port " + corePort() + " --dir \"" + rootDir + "\""
                     + " >> /data/local/tmp/vscreen.log 2>&1";
             Log.i(TAG, "starting core server: " + cmd);
             IShizukuService svc = IShizukuService.Stub.asInterface(Shizuku.getBinder());
@@ -473,8 +622,8 @@ public class VsreenBridgeService extends Service {
         new Thread(new Runnable() {
             @Override public void run() {
                 try {
-                    serverSocket = new ServerSocket(PORT, 8, InetAddress.getByName("127.0.0.1"));
-                    Log.i(TAG, "proxy listening 127.0.0.1:" + PORT);
+                    serverSocket = new ServerSocket(bridgePort(), 8, InetAddress.getByName("127.0.0.1"));
+                    Log.i(TAG, "proxy listening 127.0.0.1:" + bridgePort());
                     while (running && !serverSocket.isClosed()) {
                         final Socket s = serverSocket.accept();
                         new Thread(new Runnable() {
@@ -504,7 +653,7 @@ public class VsreenBridgeService extends Service {
             out = s.getOutputStream();
             Socket up = null;
             try {
-                up = new Socket("127.0.0.1", CORE_PORT);
+                up = new Socket("127.0.0.1", corePort());
                 up.setSoTimeout(20000);
                 OutputStream uo = up.getOutputStream();
                 uo.write(("GET " + path + " HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").getBytes("UTF-8"));
@@ -545,7 +694,7 @@ public class VsreenBridgeService extends Service {
     private String coreGet(String path, int timeoutMs) {
         InputStream is = null;
         try {
-            URL u = new URL("http://127.0.0.1:" + CORE_PORT + path);
+            URL u = new URL("http://127.0.0.1:" + corePort() + path);
             URLConnection c = u.openConnection();
             c.setConnectTimeout(timeoutMs);
             c.setReadTimeout(timeoutMs);

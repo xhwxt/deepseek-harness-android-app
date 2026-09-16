@@ -1,7 +1,7 @@
 /**
  * 虚拟屏幕插件（v1.10）：给 AI 提供真正的独立虚拟屏（createVirtualDisplay）能力。
  *
- * v1.10 架构：虚拟屏服务由 App 进程内嵌启动（打开 App 即自动运行，监听 8999）——
+ * v1.10 架构：虚拟屏服务由 App 进程内嵌启动（打开 App 即自动运行，监听 8999 / 共存版 9009）——
  * 不再需要 root/Shizuku 启动特权进程（shell/app_process 在 Android 15 enforcing 下
  * createVirtualDisplay 被 Binder 拒：Bad fd）。预览是 App 内 H264 悬浮窗（建屏自动弹出，
  * 可拖动/缩放），AI 通过本插件的 see 拿截图，tap/swipe/key/launch 通过 Shizuku
@@ -26,7 +26,9 @@ const inject = ["tools"];
 
 const APP_PROC = "/system/bin/app_process";
 const VS_DEX = "/data/local/tmp/vscreen_shizuku.jar"; // server jar 位置（特权可读）
-const SERVER_PORT = 8999;
+// v1.13.8：桥接端口由 App 通过环境变量下发（共存修复版是 9009；正式版仍是 8999）。
+// 写死 8999 会让共存版的插件打到**正式版**的桥上 —— 于是虚拟屏和预览窗都属于正式版。
+const SERVER_PORT = Number(process.env.APP_VS_PORT || 8999);
 const SERVER_MAIN = "com.deepseek.harness.vscreen.VirtualScreenServer";
 const MAX_STDOUT = 8000;
 const MAX_STDERR = 2000;

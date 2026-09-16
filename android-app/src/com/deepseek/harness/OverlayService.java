@@ -51,7 +51,17 @@ public class OverlayService extends Service {
         String p = ctx != null ? ctx.getPackageName() : "";
         if (p.contains("beta")) return 3082;
         if (p.contains("compat")) return 3084;
+        if (p.contains(".fix")) return 3086;
         return 3080;
+    }
+
+    /**
+     * v1.13.10：虚拟屏桥端口，与 {@code VsreenBridgeService.bridgePort()} 同一口径。
+     * 这里原来写死 8999 —— 共存修复版（.fix）的悬浮窗预览会去拉**正式版**那块虚拟屏的画面。
+     */
+    private static int vscreenBridgePort(Context ctx) {
+        String p = ctx != null ? ctx.getPackageName() : "";
+        return p.contains(".fix") ? 9009 : 8999;
     }
 
     private static final String PREFS = "dsh_prefs";
@@ -562,12 +572,13 @@ public class OverlayService extends Service {
         }
     }
 
-    /** 预览帧拉取任务：HTTP GET 127.0.0.1:8999/vscreen/preview → base64 JPEG → ImageView。 */
+    /** 预览帧拉取任务：HTTP GET 127.0.0.1:{本变体的桥端口}/vscreen/preview → base64 JPEG → ImageView。 */
     private final Runnable vscreenPreviewRunnable = new Runnable() {
         @Override public void run() {
             if (!vscreenPreviewRunning || !isRunning) return;
             try {
-                HttpURLConnection c = (HttpURLConnection) new URL("http://127.0.0.1:8999/vscreen/preview").openConnection();
+                HttpURLConnection c = (HttpURLConnection) new URL(
+                        "http://127.0.0.1:" + vscreenBridgePort(OverlayService.this) + "/vscreen/preview").openConnection();
                 c.setConnectTimeout(2000); c.setReadTimeout(2000);
                 String resp = readAll(c.getInputStream());
                 c.disconnect();

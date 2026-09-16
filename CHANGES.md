@@ -1,3 +1,186 @@
+## v1.13.10（正式版 + 共存修复版 · 2026-09-16）
+
+> 接 v1.13.9：**找到「共存版预览窗没有控制条」的真凶** —— 之前 v1.13.8 的端口解释是错的。
+> versionCode **37**，内核仍为 DSH 0.1.5-rc.1。
+
+### 🐛 真凶：共存版的虚拟屏桥**根本没启动**（ClassNotFoundException）
+
+- 真机 logcat 实证（用户实测 v1.13.7 后翻出来的）：
+  ```
+  09-16 15:25:51.785 W DeepSeekHarness: start VsreenBridgeService failed
+  java.lang.ClassNotFoundException: com.deepseek.harness.fix.VsreenBridgeService
+  ```
+- 成因：`MainActivity` 用 `Class.forName(getPackageName() + ".VsreenBridgeService")` 启动桥服务。
+  共存版只改了 **manifest 包名**（`com.deepseek.harness.fix`），Java 类仍在 `com.deepseek.harness` 下
+  （aapt `--custom-package` 保证 R 可用）→ 反射找不到类 → 桥没起 → **预览窗永远不出现**、
+  `/vscreen/*` 代理也不存在；插件写死 8999，于是连"建虚拟屏"都落到正式版上。
+  用户看到的那个「没有控制条」的预览窗 = **正式版 v1.13.6 的窗**。
+- 修法：改用**类字面量** `startService(new Intent(this, VsreenBridgeService.class))`（变体安全）。
+- 防回归：`build.sh` 的共存变体新增**自检** —— 源码里再出现 `getPackageName() + ".Xxx"` 直接构建失败。
+- 说明：v1.13.8 的端口隔离（桥 9009 / 核心 9008 + `APP_VS_PORT`）**仍然需要**：
+  桥能起来之后，两个 App 同时监听 8999 才是下一个坑。
+
+### 🔬 复核：用户「1.13.7 没有控制条」→ 看到的是 1.13.6 的窗（结论不变，且被反向佐证）
+
+- **设备上装了什么**（`dumpsys package` 实测）：
+  | 包 | versionCode | versionName | 安装时间 |
+  |---|---|---|---|
+  | `com.deepseek.harness`（正式版） | 33 | **1.13.6** | 09-16 07:50 |
+  | `com.deepseek.harness.fix`（共存版） | 34 | **1.13.7** | 09-16 12:22 |
+  全机唯一跑 1.13.7 代码的是共存版。
+- **用户测的就是这份 fix APK**：`/sdcard/Download/DeepSeekHarness-fix-v1.13.7.apk`
+  与已安装 base.apk **字节一致** —— md5 `eefb0f4dc7f3105b525d99c34ee84928`，123163799 B。
+  - 它的 `classes.dex` 里**有**控制条代码（字符串 `✕`、`previewButton` 各 1 处）；
+    同时有 `forName` / `getPackageName` → 反射启动 `.fix.VsreenBridgeService` → 必然 CNFE（logcat 已证）
+    → **这份 APK 的预览窗代码在本机从未被执行过**。
+- **对照组**：已安装的 v1.13.6 `base.apk`（md5 `9bcd5d04a50333f3cbbb86fc03a353ac`）
+  dex 里 `✕` / `previewButton` / `▾` / `clampPreviewBounds` **全部 0 处**
+  → 它的预览窗**结构上不可能**有控制条。
+- 全仓库只有 `VsreenBridgeService` 会画虚拟屏预览窗（`vscreen/Main.java` 是纯 shell 服务端，不建窗），
+  所以屏幕上出现的那个窗只能来自 v1.13.6。
+- **结论**：用户「1.13.7 没有控制条」是对**屏幕**的正确观察，但那个窗不是 1.13.7 画的 ——
+  不能据此推翻 v1.13.10 的 CNFE 判断，反而是它的独立佐证（共存版连窗都画不出来）。
+- **仍未验证**：控制条**能否正常渲染**（`✕`/`▾` 的尺寸/可见性/位置）。这段代码在本机一次都没跑过；
+  要验证必须先过 CNFE 这关（v1.13.10 已改类字面量）→ 重新打包 vc37 双变体 → 装共存版 →
+  `logcat | grep VsreenBridge` 看到「预览窗已显示」后，再看按钮条。
+
+### 🔬 复核 II：装了 1.13.9 还是「没有」——因为修 CNFE 的那行在 1.13.10，而 vc37 从未出包
+
+- **安装事实**：`com.deepseek.harness.fix` 于 09-16 **16:13:17** 升级到 versionCode **36 / 1.13.9**
+  （`dumpsys package` 实测；已安装 base.apk md5 `f4688db8bc9d644923ce1c0e2d1f1d97`，123167895 B）。
+- **1.13.9 里该有的都在，只缺 1.13.10 那一行**：dex 里有 `bridgePort` / `corePort` / `APP_VS_PORT`
+  （v1.13.8 端口派生）、`clampPreviewBounds`（v1.13.8 夹边界）、`✕` / `previewButton`（v1.13.7 按钮条），
+  但 **`forName` + `getPackageName` 仍在** → 反射启动照旧 CNFE。
+- **真机 logcat（同一共存版进程 PID 7405）**：16:13:21 / 16:20:05 / 16:20:11 / 16:20:43 共 4 次
+  `ClassNotFoundException: com.deepseek.harness.fix.VsreenBridgeService`。
+- **同期真正出窗的是正式版**：PID **32233 = `com.deepseek.harness`（1.13.6）**
+  16:10:28 `VsreenBridgeService started (proxy 8999 -> core 8998)` → 16:19:11 `虚拟屏预览窗已显示`。
+  `ss -ltnp` 当场也只有 8999（桥）/ 8998（core）/ 3080（引擎）在听。
+- ⇒ 用户这次「装了 1.13.9 还是没有」同样是**必然**：屏幕上那个窗仍然是 1.13.6 画的，而 1.13.6 无按钮代码。
+- **下一步（唯一能判定的路径）**：用当前源码（vc**37** / 1.13.10，含类字面量修复）出包 → 装共存版 →
+  判据是 logcat 出现 `VsreenBridgeService started (proxy 9009 -> core 9008)` + 「预览窗已显示」；
+  在那个前提下窗里再没有 `✕`/`▾`，才算按钮渲染真有问题。
+  ⚠️ 本机**没有**构建工具链（`javac`/`aapt`/`d8`/`apksigner` 均不在 PATH；`android-app/env.sh`
+  指向的 `/data/data/com.coomi.android/files/usr` 是 Operit 的私有目录，App 身份与 shizuku shell 都读不到）
+  → 需在平时出包的那个环境里构建。
+
+### 🧱 v1.13.10 顺带硬化：共存版还有 5 处「指向正式版」的写死
+
+> 这几处不修，就算 CNFE 修好了，共存版的测试结果依然会被**正式版**污染（用户会第三次说「还是没有」）。
+
+1. `VsreenBridgeService.onCreate()` 的启动日志把端口写死在文案里（`"proxy 8999 -> core 8998"`）——
+   共存版实际跑 9009/9008，照着这行日志排查会得出错误结论。改为打印 `bridgePort()` / `corePort()` 真实值。
+2. `OverlayService` 悬浮窗预览写死 `http://127.0.0.1:8999/vscreen/preview` ——
+   共存版的悬浮窗会去拉**正式版**那块虚拟屏的画面。改为新增 `vscreenBridgePort(ctx)`，按包名取 9009。
+3. `MainActivity.vscreenAlive()` 探活写死 8999 —— 共存版会探到正式版的桥并误判「server 已在监听」。
+   改为 `vscreenBridgePort()`。
+4. `VsreenBridgeService` 拉起 core 前的 `killOld` **只按类名匹配**，而两个变体的 core 类名完全相同
+   （`com.deepseek.harness.vscreen.Main`）→ 共存版会把**正式版**的 core 一起 `kill -9`，
+   两个 `coreWatcher` 再互相拉起 = 反复对杀、预览窗取不到帧。
+   改为按 `--port <corePort>` 匹配（`grep -E '…Mai[n] --port 9008( |$)'`），只杀本变体的 core。
+   —— 已用 `ps -A -o PID,ARGS` 在真机验证该正则能命中 core（pid 31788，`--port 8998`），
+   且 `Mai[n]` 括号技巧仍保证不匹配 `grep` 自身。
+5. 两个 App 原来都往**同一个** `/data/local/tmp/vscreen_shizuku.jar` 拷各自包里的那份（两份并不相同：
+   正式版 14269 B / 共存版 14289 B）→ 谁后启动谁覆盖，对方 core 重启时就加载到**别人那份**代码
+   （若两变体 core 的 `BUILD` 指纹不同，还会触发对方的 `EXPECTED_CORE_BUILD` 判定 → 继续对杀）。
+   改为按变体分开：`.../vscreen_shizuku_fix.jar`。`/data/local/tmp/vscreen.log` 仍共用
+   （启动行带 `port=`，可按端口归属，暂不动）。
+
+---
+
+## v1.13.9（正式版 + 共存修复版 · 2026-09-16）
+
+> 接 v1.13.8：**正式版实测反馈**「有预览窗时双指捏合会把整个对话页缩放」。
+> versionCode **36**，内核仍为 DSH 0.1.5-rc.1。
+
+### 🐛 网页被双指缩放（有预览窗时必现，没有预览窗时又缩不动）
+
+- **成因**：DSH 原生 `index.html` 的 viewport 只写了 `width=device-width, initial-scale=1`，
+  **没有** `user-scalable=no` / `maximum-scale`；WebView 侧的 `setSupportZoom(false)`
+  在现代 WebView 上并不能可靠禁掉 pinch-zoom（viewport 声明才是权威）。
+  预览窗出现/尺寸变化会让 WebView 重排，而 `setLoadWithOverviewMode(true)` 下
+  Chrome 会顺便重算页面缩放 —— 于是"有时能缩"被暴露出来。
+- **修法（两层，都不改内核代码）**：
+  1. `mobile-patch/inject.sh` 第 3 步：给 viewport 补 `maximum-scale=1.0, user-scalable=no`；
+  2. `mobile-patch/mobile.js` v0.5 段：捕获阶段拦 ≥2 指的 `touchmove` / `gesture*`
+     并 `preventDefault()`（`passive:false` 才拦得住）。
+- **不影响**虚拟屏预览窗的双指缩放：它是独立原生窗口，不走网页事件。
+- 若个别机型仍能缩，下一档手段是 `setLoadWithOverviewMode(false)`（会改变首屏缩放行为，
+  需真机看排版后再定）。
+
+---
+
+## v1.13.8（正式版 + 共存修复版 · 2026-09-16）
+
+> 接 v1.13.7：**共存版真机装包后实测暴露**的 4 个问题。
+> versionCode **35**，内核仍为 DSH 0.1.5-rc.1。
+
+### 🐛 共存版实测问题
+
+1. **「控制条没有出现」** —— 不是按钮没画，而是**看到的预览窗根本不是共存版的**：
+   桥接端口 8999 / 核心端口 8998 在 `VsreenBridgeService` 里写死，正式版先占用后，
+   共存版的桥 `bind` 静默失败 → 它的预览窗根本建不出来；插件 `dsh-tool-vscreen` 也写死连 8999，
+   于是连「创建虚拟屏」都落到正式版上（真机 `dumpsys`：8999 处于 LISTEN，且只有正式版在连 8998）。
+   现在两端都按包名派生：**共存版桥 9009 / 核心 9008**（正式版仍是 8999/8998），
+   App 通过环境变量 `APP_VS_PORT` 把端口下发给插件。
+   ⚠️ 插件在 payload 里由 `$DSH_DEV_HOME/dshroot` 提供，改完要跑
+   `sh plugins/sync-to-devhome.sh "$DSH_DEV_HOME"` 再打包。
+2. **没有隐藏/最小化** —— 预览窗新增 `▾` 最小化/展开（只留按钮栏，虚拟屏照常运行）；
+   `✕` 仍是「关掉预览窗、虚拟屏继续跑」。**缩放不加按钮**：按钮栏只保留这两个，
+   缩放继续用双指捏合（用户明确要求）。
+3. **状态栏不跟随主题色** —— 去掉 `styles.xml` 里写死的 `statusBarColor/navigationBarColor`，
+   改由 `MainActivity.applyStatusBar()` 按主题（跟随系统深/浅色）运行时设置；
+   浅色模式加 `SYSTEM_UI_FLAG_LIGHT_STATUS_BAR`（深色图标），深色模式反之。
+4. **预览窗能被撑到满屏、按钮条被推出屏幕** —— 新增 `clampPreviewBounds()`：建窗 /
+   双指缩放 / 拖动 / 折叠，**所有**改窗口几何的路径统一夹边界，
+   最大占屏 **70%**（宽与可用高），并扣掉状态栏占位（真机实测窗口坐标系偏移 133px）。
+   此前只有「按钮缩放」夹了边界，双指放大就能把窗口撑出屏幕。
+
+---
+
+## v1.13.7（正式版 + 共存修复版 · 2026-09-16）
+
+> 一轮「用户实测反馈」驱动的修复：**6 个手机端问题**（全部定位到源码，多数带真机取证），
+> 外加 `build.sh` 的**变体参数**（一条命令出可与正式版并存的修复版）。
+> versionCode **34**，内核仍为 DSH 0.1.5-rc.1。
+
+### 🐛 六个实测问题
+
+1. **回车直接发送、没法换行** —— composer 的 Enter 映射只在 `shiftKey === true` 时放行换行，
+   而手机软键盘没有 Shift。`mobile-patch/mobile.js` 新增 v0.4 段：捕获阶段拦下裸 Enter，
+   阻止发送后补发一个 `shiftKey=true` 的合成 keydown，让编辑器走它**自带**的换行路径
+   （不自己拼 DOM，避免与 React/Lexical 受控状态脱节）；`Ctrl/Cmd+Enter` 仍是发送。
+2. **控制台「重启」点了没反应、引擎其实没被重启** —— `nodeProcess` 是 Activity 字段，
+   Activity/进程重建后句柄变成 `null`，`destroy()` 空转；紧接着探针看到端口还在 listen，
+   就只重进主界面。现改为扫 `/proc` 定位**同 uid** 的引擎进程（`bin.js` + `web` + `--port`）
+   后 `SIGTERM` → 6 秒 → `SIGKILL` 兜底；「停止」同样改走它（句柄丢了也能停）。
+   真机实测：App 身份读得到 `/proc/<pid>/cmdline`，Shizuku shell 反而杀不动它（EPERM）。
+3. **虚拟屏预览窗只能拖，没法隐藏/缩小** —— 右上角新增 `✕ / − / ＋` 三个圆钮；`✕` 会记下
+   “是用户主动关的”，轮询不再把它弹回来（虚拟屏销毁/换新的一块会恢复自动弹出）；
+   拖动夹在屏幕范围内，避免手滑拖出屏幕后找不回来。
+4. **状态栏被隐藏、顶部一大块黑** —— `Theme.Black.NoTitleBar.Fullscreen` 藏掉状态栏，
+   ColorOS 还把窗口整体下移（真机 `dumpsys`：`fl=…FULLSCREEN`、`SurfPosition=Point(0,133)`，
+   即最上面 133px 没有任何人绘制）。改用 `res/values/styles.xml` 的 `AppTheme`
+   （父主题去掉 `.Fullscreen`，状态栏/导航栏/窗口底色统一 `#0b0f1a`）。
+5. **弹窗卡片外还套着一层深色圆角框** —— `AlertDialog` 的面板背景来自 Activity 主题、
+   画在**对话框布局自己身上**，旧代码只把*窗口*背景设成透明，所以那层框一直在。
+   `conDialogView` 改为 Activity 内自绘浮层（遮罩 + 圆角卡片），点空白/返回键 = 取消。
+6. **横竖屏跟随上一个应用而不是系统** —— `android:screenOrientation="unspecified"` 会沿用
+   当前屏幕旋转：从横屏游戏切回来仍是横屏。改成 `fullUser`：自动旋转开着跟随重力感应，
+   锁定方向时跟随用户锁定。
+
+### 🧩 `build.sh` 变体参数：共存修复版
+
+- `sh build.sh`（默认）= 正式版 `com.deepseek.harness`；`sh build.sh coexist` =
+  `com.deepseek.harness.fix`（端口 3086，数据目录 `/sdcard/DeepSeekHarnessFix`），
+  与正式版**同时安装、互不覆盖**。
+- 实现：源码目录结构不动，打包时换 manifest 的 `package` / 两个 provider authority，
+  并把组件名展开成绝对包名（`.MainActivity` 在 `.fix` 包下会被解析成
+  `com.deepseek.harness.fix.MainActivity` → 启动即 ClassNotFound），
+  再用 `aapt --custom-package com.deepseek.harness` 让 `R.java` 仍生成在原包。
+
+---
+
 ## v1.13.6（正式版 + Lite 共存版 + 兼容版 · 2026-09-15）
 
 > 接 v1.13.5：把「**升级用户**」那条路径也覆盖到 —— dex 收权在“文件已存在直接返回”分支也要做。
