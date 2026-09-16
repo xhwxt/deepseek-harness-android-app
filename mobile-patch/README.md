@@ -32,3 +32,12 @@ DSH 原生前端是桌面端设计，本目录的补丁把它适配到手机屏�
 1. 前端 CSS 类名（`.p-xYUq_actions`、`.wSkVaW_header` 等）是运行时插件**动态注入**的 CSS module 类名，不在预构建 bundle 里；改样式前先用 DevTools/源码确认真实类名
 2. 改完运行目录里的 `mobile.css/js` 后，需**彻底杀掉 App 重开**（node 进程内存缓存旧模块），仅刷新页面不生效
 3. 不要用 JS 把 DOM 移到 `#root` 外（React 事件委托挂 #root，移出后 onClick 全失效）；改位置用 CSS `position:fixed`
+
+## v1.13.9 新增：禁止网页被双指缩放
+
+- `inject.sh` 第 3 步：给 `dist/index.html` 的 viewport 补 `maximum-scale=1.0, user-scalable=no`
+- `mobile.js` v0.5 段：捕获阶段拦 ≥2 指的 `touchmove` / `gesture*` 并 preventDefault
+
+症状：**预览窗存在时**双指捏合会把整个对话页缩放（正式版实测），没有预览窗时又缩不动。
+成因：viewport 没禁用户缩放 + WebView `setSupportZoom(false)` 在现代 WebView 上不足以禁掉 pinch。
+注意：虚拟屏预览窗是独立原生窗口，它的双指缩放不受这两层影响。

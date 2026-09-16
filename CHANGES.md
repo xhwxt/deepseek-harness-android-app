@@ -1,3 +1,25 @@
+## v1.13.9（正式版 + 共存修复版 · 2026-09-16）
+
+> 接 v1.13.8：**正式版实测反馈**「有预览窗时双指捏合会把整个对话页缩放」。
+> versionCode **36**，内核仍为 DSH 0.1.5-rc.1。
+
+### 🐛 网页被双指缩放（有预览窗时必现，没有预览窗时又缩不动）
+
+- **成因**：DSH 原生 `index.html` 的 viewport 只写了 `width=device-width, initial-scale=1`，
+  **没有** `user-scalable=no` / `maximum-scale`；WebView 侧的 `setSupportZoom(false)`
+  在现代 WebView 上并不能可靠禁掉 pinch-zoom（viewport 声明才是权威）。
+  预览窗出现/尺寸变化会让 WebView 重排，而 `setLoadWithOverviewMode(true)` 下
+  Chrome 会顺便重算页面缩放 —— 于是"有时能缩"被暴露出来。
+- **修法（两层，都不改内核代码）**：
+  1. `mobile-patch/inject.sh` 第 3 步：给 viewport 补 `maximum-scale=1.0, user-scalable=no`；
+  2. `mobile-patch/mobile.js` v0.5 段：捕获阶段拦 ≥2 指的 `touchmove` / `gesture*`
+     并 `preventDefault()`（`passive:false` 才拦得住）。
+- **不影响**虚拟屏预览窗的双指缩放：它是独立原生窗口，不走网页事件。
+- 若个别机型仍能缩，下一档手段是 `setLoadWithOverviewMode(false)`（会改变首屏缩放行为，
+  需真机看排版后再定）。
+
+---
+
 ## v1.13.8（正式版 + 共存修复版 · 2026-09-16）
 
 > 接 v1.13.7：**共存版真机装包后实测暴露**的 4 个问题。
