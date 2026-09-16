@@ -1,3 +1,46 @@
+## v1.13.7（正式版 + 共存修复版 · 2026-09-16）
+
+> 一轮「用户实测反馈」驱动的修复：**6 个手机端问题**（全部定位到源码，多数带真机取证），
+> 外加 `build.sh` 的**变体参数**（一条命令出可与正式版并存的修复版）。
+> versionCode **34**，内核仍为 DSH 0.1.5-rc.1。
+
+### 🐛 六个实测问题
+
+1. **回车直接发送、没法换行** —— composer 的 Enter 映射只在 `shiftKey === true` 时放行换行，
+   而手机软键盘没有 Shift。`mobile-patch/mobile.js` 新增 v0.4 段：捕获阶段拦下裸 Enter，
+   阻止发送后补发一个 `shiftKey=true` 的合成 keydown，让编辑器走它**自带**的换行路径
+   （不自己拼 DOM，避免与 React/Lexical 受控状态脱节）；`Ctrl/Cmd+Enter` 仍是发送。
+2. **控制台「重启」点了没反应、引擎其实没被重启** —— `nodeProcess` 是 Activity 字段，
+   Activity/进程重建后句柄变成 `null`，`destroy()` 空转；紧接着探针看到端口还在 listen，
+   就只重进主界面。现改为扫 `/proc` 定位**同 uid** 的引擎进程（`bin.js` + `web` + `--port`）
+   后 `SIGTERM` → 6 秒 → `SIGKILL` 兜底；「停止」同样改走它（句柄丢了也能停）。
+   真机实测：App 身份读得到 `/proc/<pid>/cmdline`，Shizuku shell 反而杀不动它（EPERM）。
+3. **虚拟屏预览窗只能拖，没法隐藏/缩小** —— 右上角新增 `✕ / − / ＋` 三个圆钮；`✕` 会记下
+   “是用户主动关的”，轮询不再把它弹回来（虚拟屏销毁/换新的一块会恢复自动弹出）；
+   拖动夹在屏幕范围内，避免手滑拖出屏幕后找不回来。
+4. **状态栏被隐藏、顶部一大块黑** —— `Theme.Black.NoTitleBar.Fullscreen` 藏掉状态栏，
+   ColorOS 还把窗口整体下移（真机 `dumpsys`：`fl=…FULLSCREEN`、`SurfPosition=Point(0,133)`，
+   即最上面 133px 没有任何人绘制）。改用 `res/values/styles.xml` 的 `AppTheme`
+   （父主题去掉 `.Fullscreen`，状态栏/导航栏/窗口底色统一 `#0b0f1a`）。
+5. **弹窗卡片外还套着一层深色圆角框** —— `AlertDialog` 的面板背景来自 Activity 主题、
+   画在**对话框布局自己身上**，旧代码只把*窗口*背景设成透明，所以那层框一直在。
+   `conDialogView` 改为 Activity 内自绘浮层（遮罩 + 圆角卡片），点空白/返回键 = 取消。
+6. **横竖屏跟随上一个应用而不是系统** —— `android:screenOrientation="unspecified"` 会沿用
+   当前屏幕旋转：从横屏游戏切回来仍是横屏。改成 `fullUser`：自动旋转开着跟随重力感应，
+   锁定方向时跟随用户锁定。
+
+### 🧩 `build.sh` 变体参数：共存修复版
+
+- `sh build.sh`（默认）= 正式版 `com.deepseek.harness`；`sh build.sh coexist` =
+  `com.deepseek.harness.fix`（端口 3086，数据目录 `/sdcard/DeepSeekHarnessFix`），
+  与正式版**同时安装、互不覆盖**。
+- 实现：源码目录结构不动，打包时换 manifest 的 `package` / 两个 provider authority，
+  并把组件名展开成绝对包名（`.MainActivity` 在 `.fix` 包下会被解析成
+  `com.deepseek.harness.fix.MainActivity` → 启动即 ClassNotFound），
+  再用 `aapt --custom-package com.deepseek.harness` 让 `R.java` 仍生成在原包。
+
+---
+
 ## v1.13.6（正式版 + Lite 共存版 + 兼容版 · 2026-09-15）
 
 > 接 v1.13.5：把「**升级用户**」那条路径也覆盖到 —— dex 收权在“文件已存在直接返回”分支也要做。

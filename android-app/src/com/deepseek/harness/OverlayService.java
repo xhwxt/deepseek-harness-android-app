@@ -51,6 +51,7 @@ public class OverlayService extends Service {
         String p = ctx != null ? ctx.getPackageName() : "";
         if (p.contains("beta")) return 3082;
         if (p.contains("compat")) return 3084;
+        if (p.contains(".fix")) return 3086;
         return 3080;
     }
 

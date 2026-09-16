@@ -18,8 +18,10 @@ import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 import android.view.View;
 import android.view.WindowManager;
+import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import java.io.BufferedReader;
@@ -94,6 +96,8 @@ public class VsreenBridgeService extends Service {
     private volatile int vdDisplayId = -1;
     /** 已应用的宽高比，用于只在变屏/旋转时重算窗口高度，不干扰用户手动拖动/缩放。 */
     private volatile float lastAspect = 0f;
+    /** v1.13.7 问题③：用户点了 ✕ 关掉的虚拟屏 displayId —— 轮询别再自动把它弹回来。 */
+    private volatile int previewDismissedDisplayId = Integer.MIN_VALUE;
 
     private void showPreviewWindow() {
         try {
@@ -132,6 +136,26 @@ public class VsreenBridgeService extends Service {
                     new FrameLayout.LayoutParams(
                             FrameLayout.LayoutParams.MATCH_PARENT,
                             FrameLayout.LayoutParams.MATCH_PARENT));
+
+            // v1.13.7 问题③：原来预览窗只有「拖动 + 双指缩放」，界面上**没有任何关闭/缩小的入口**，
+            // 用户只能干看着它悬在屏幕上挡着（想关只能让 AI 调 android_vscreen_close）。
+            // 现在在右上角加三个小钮：✕ 关闭预览、− 缩小、＋ 放大（拖动 / 双指缩放照旧可用）。
+            LinearLayout ctl = new LinearLayout(this);
+            ctl.setOrientation(LinearLayout.HORIZONTAL);
+            ctl.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+            ctl.addView(previewButton("✕", new Runnable() { @Override public void run() {
+                // 记下“是用户主动关的”：轮询发现虚拟屏还在跑时不要再自动弹回来（换一块虚拟屏会重新弹）
+                previewDismissedDisplayId = vdDisplayId;
+                hidePreviewWindow();
+            }}));
+            ctl.addView(previewButton("−", new Runnable() { @Override public void run() { scalePreview(0.8f); } }));
+            ctl.addView(previewButton("＋", new Runnable() { @Override public void run() { scalePreview(1.25f); } }));
+            FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+            clp.gravity = Gravity.TOP | Gravity.END;
+            clp.topMargin = dp(4);
+            clp.rightMargin = dp(4);
+            previewRootView.addView(ctl, clp);
 
             // 建窗即按当前虚拟屏比例算尺寸（否则要等下一次比例“变化”才生效）
             lastAspect = 0f;
@@ -173,8 +197,11 @@ public class VsreenBridgeService extends Service {
                             if (!scaleDetector.isInProgress()) {
                                 float dx = e.getRawX() - downX;
                                 float dy = e.getRawY() - downY;
-                                previewLp.x = Math.round(startLpX + dx);
-                                previewLp.y = Math.round(startLpY + dy);
+                                // v1.13.7 问题③：夹在屏幕范围内，避免手一滑把预览窗拖出屏幕后「找不回来」
+                                int maxX = Math.max(0, getResources().getDisplayMetrics().widthPixels - previewLp.width);
+                                int maxY = Math.max(0, getResources().getDisplayMetrics().heightPixels - previewLp.height);
+                                previewLp.x = Math.min(Math.max(Math.round(startLpX + dx), 0), maxX);
+                                previewLp.y = Math.min(Math.max(Math.round(startLpY + dy), 0), maxY);
                                 updatePreviewLayout();
                             }
                             return true;
@@ -200,6 +227,61 @@ public class VsreenBridgeService extends Service {
         } catch (Throwable ignored) {
             // 生命周期竞态：窗口已移除时忽略（历史闪退根因）
         }
+    }
+
+    /**
+     * v1.13.7 问题③：预览窗右上角的小圆钮（✕ / − / ＋）。
+     * 半透明圆角底 + 白字，直接叠在画面上；按钮自己消费点击，
+     * 所以点按钮不会触发根布局的拖动/缩放。
+     */
+    private Button previewButton(String text, final Runnable action) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setTextSize(13);
+        b.setTextColor(0xFFFFFFFF);
+        b.setPadding(dp(9), 0, dp(9), 0);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+        b.setMinHeight(0);
+        b.setMinimumHeight(0);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0x99000000);
+        bg.setCornerRadius(dp(7));
+        b.setBackground(bg);
+        b.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { try { action.run(); } catch (Throwable ignored) {} }
+        });
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, dp(30));
+        lp.leftMargin = dp(4);
+        b.setLayoutParams(lp);
+        return b;
+    }
+
+    /** v1.13.7 问题③：按钮式缩放（与双指缩放共用同一套边界），高度按虚拟屏比例同步，保持不变形。 */
+    private void scalePreview(final float factor) {
+        previewHandler.post(new Runnable() {
+            @Override public void run() {
+                try {
+                    if (previewLp == null) return;
+                    final int maxW = getResources().getDisplayMetrics().widthPixels;
+                    final int maxH = getResources().getDisplayMetrics().heightPixels;
+                    int nw = Math.round(previewLp.width * factor);
+                    if (nw < dp(120)) nw = dp(120);
+                    if (nw > maxW) nw = maxW;
+                    float ratio = lastAspect > 0f ? lastAspect : (vdW > 0 ? vdH / (float) vdW : 0f);
+                    int nh = ratio > 0f ? Math.round(nw * ratio) : Math.round(previewLp.height * factor);
+                    if (nh < dp(110)) nh = dp(110);
+                    if (nh > maxH) nh = maxH;
+                    previewLp.width = nw;
+                    previewLp.height = nh;
+                    // 缩完可能顶到屏幕外 → 顺手夹回屏幕内
+                    previewLp.x = Math.min(Math.max(previewLp.x, 0), Math.max(0, maxW - nw));
+                    previewLp.y = Math.min(Math.max(previewLp.y, 0), Math.max(0, maxH - nh));
+                    updatePreviewLayout();
+                } catch (Throwable ignored) {}
+            }
+        });
     }
 
     private void hidePreviewWindow() {
@@ -241,9 +323,12 @@ public class VsreenBridgeService extends Service {
                             vdH = jsonInt(st, "height", 0);
                             if (id >= 0 && vdW > 0 && vdH > 0) applyAspect(vdW, vdH);
                             if (id >= 0 && jsonBool(st, "running")) {
-                                if (!previewWindowVisible) showPreviewWindow();
-                            } else if (previewWindowVisible) {
-                                hidePreviewWindow();
+                                // v1.13.7 问题③：用户手动 ✕ 关掉的那块虚拟屏不再自动弹回来
+                                // （虚拟屏被关掉/换新的一块时下面会清掉这个标记）
+                                if (!previewWindowVisible && id != previewDismissedDisplayId) showPreviewWindow();
+                            } else {
+                                if (id < 0) previewDismissedDisplayId = Integer.MIN_VALUE;   // 虚拟屏已销毁 → 下次重建照常弹预览
+                                if (previewWindowVisible) hidePreviewWindow();
                             }
                         }
                         sinceStatus--;
@@ -319,7 +404,7 @@ public class VsreenBridgeService extends Service {
         // 用错目录会拿到另一个根目录下的旧 jar（8998 跑旧版服务端 → 缺新路由 → 工具报错）。
         String p = getPackageName();
         return p.contains("beta") ? "DeepSeekHarnessLite"
-                : p.contains("compat") ? "DeepSeekHarnessCompat" : "DeepSeekHarness";
+                : p.contains("compat") ? "DeepSeekHarnessCompat" : p.contains(".fix") ? "DeepSeekHarnessFix" : "DeepSeekHarness";
     }
 
     // ==================== 生命周期 ====================

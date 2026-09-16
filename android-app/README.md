@@ -57,3 +57,28 @@ sh build.sh
 - ⚠️ **targetSdk 必须保持 28**（≥29 时 Android 把私有目录挂 noexec，node 起不来）
 - `release.jks` 与密码**绝不提交仓库**（.gitignore 已排除）
 - 安装包自测方法（防 ERR_CONNECTION_REFUSED）：抽出 payload 实测引擎 HTTP 200，见 `docs/开发指南.md` / `交接文档.md`
+
+## 变体：正式版 / 共存修复版（v1.13.7 新增）
+
+```sh
+sh build.sh            # 正式版     com.deepseek.harness        端口 3080  /sdcard/DeepSeekHarness
+sh build.sh coexist    # 共存修复版 com.deepseek.harness.fix    端口 3086  /sdcard/DeepSeekHarnessFix
+# 产物：android-app/DeepSeekHarness.apk / android-app/DeepSeekHarness-fix.apk
+```
+
+共存版与正式版**包名不同**，可同时安装、互不覆盖：
+
+| | 正式版 | 共存修复版 |
+|---|---|---|
+| 包名 | `com.deepseek.harness` | `com.deepseek.harness.fix` |
+| 引擎端口 | 3080（通知 3081 / 无障碍 3181） | 3086 |
+| 外部目录 | `/sdcard/DeepSeekHarness` | `/sdcard/DeepSeekHarnessFix` |
+| provider authority | `…harness.shizuku` / `…harness.logshare` | `…harness.fix.shizuku` / `…harness.fix.logshare` |
+
+实现（`build.sh` 里那段 `case "$VARIANT"`）：源码目录结构完全不动，只在打包时把 manifest 的
+`package`、两个 provider authority 换掉，并把**组件名展开成绝对包名**——`.MainActivity` 在 `.fix`
+包下会被解析成 `com.deepseek.harness.fix.MainActivity`，不展开就是启动即 ClassNotFound；
+同时用 `aapt --custom-package com.deepseek.harness` 让 `R.java` 仍生成在原包，否则 javac 找不到 R。
+
+⚠️ 共存版是**另一个 App**：应用私有数据（API Key / 会话 / 凭证）不与正式版共享，
+首次打开需要在设置页重新填一次 API Key；外部目录也是独立的，不会动正式版的数据。
